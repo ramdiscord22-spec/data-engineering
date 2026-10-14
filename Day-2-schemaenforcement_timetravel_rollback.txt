@@ -1,0 +1,72 @@
+1. Schema Enforcement (Schema Validation)
+What it is: The default defense mechanism of Delta Lake that prevents bad or unexpected data structures from writing into a table.
+
+Why it matters in production: In traditional data lakes (plain Parquet/CSV on S3/ADLS), if an upstream API or registration form adds a random column or changes a type, it gets written directly to storage. Downstream queries, reporting dashboards, and ML models crash silently or fail to parse the files.
+
+How Delta Lake handles it:
+
+When a write is initiated, Delta Lake compares the schema of the incoming DataFrame/SQL statement against the schema stored in the latest commit in _delta_log.
+
+If there is an extra column, missing non-nullable column, or data type mismatch, Delta throws an AnalysisException.
+
+ACID Guarantee: The transaction fails before any data is committed. The table remains clean and untouched (Atomicity).
+
+2. Schema Evolution (mergeSchema / ALTER TABLE)
+What it is: The deliberate, controlled process of expanding a table's schema when business requirements legitimately change.
+
+Two ways to evolve schema:
+
+SQL-first approach:
+
+SQL
+ALTER TABLE dev_lakehouse.customers_bronze 
+ADD COLUMN phone_number STRING;
+PySpark programmatic approach:
+
+Python
+df_new.write \
+    .format("delta") \
+    .mode("append") \
+    .option("mergeSchema", "true") \
+    .saveAsTable("dev_lakehouse.customers_bronze")
+Handling historical records:
+
+Existing Parquet files are not rewritten.
+
+When reading older records that existed before the column was added, Delta Lake automatically fills those column values with NULL.
+
+3. Delta Table Audit Log (DESCRIBE HISTORY)
+Command:
+
+SQL
+DESCRIBE HISTORY dev_lakehouse.customers_bronze;
+What it exposes:
+
+version: Monotonically increasing integer (0, 1, 2, 3...).
+
+timestamp: Exact millisecond timestamp of the commit.
+
+operation: The command that executed (CREATE TABLE, WRITE, ADD COLUMNS, RESTORE, etc.).
+
+operationParameters: Specific settings used (e.g., mode, predicates).
+
+Under the Hood: Databricks reads the individual JSON files in _delta_log/ (000000.json, 000001.json, etc.) to construct this table.
+
+4. Time Travel & Disaster Recovery
+Inspecting Historical Snapshots
+You can query any point in time without restoring backups:
+
+SQL
+-- Query by commit version number
+SELECT * FROM dev_lakehouse.customers_bronze VERSION AS OF 1;
+
+-- Query by timestamp
+SELECT * FROM dev_lakehouse.customers_bronze TIMESTAMP AS OF '2026-10-14 10:00:00';
+How it works internally: The engine ignores any commit JSON files written after that version/timestamp, reading only the Parquet files that were marked as active at that exact snapshot.
+
+Production Rollbacks
+If a pipeline corrupts a table at Version 4, you can roll back to the clean Version 3:
+
+SQL
+RESTORE TABLE dev_lakehouse.customers_bronze TO VERSION AS OF 3;
+Critical Interview Fact: The transaction log is append-only. Delta Lake never deletes Version 4 to restore Version 3. Instead, it writes a brand-new commit (Version 5) stating: "Make the active file list match Version 3." This preserves the complete historical audit trail.

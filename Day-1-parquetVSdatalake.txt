@@ -1,0 +1,78 @@
+1. File Formats: CSV vs. Parquet
+	What is CSV? (Row-Oriented Format)
+		○ Storage Layout: Stores data line by line (Row 1: [col1, col2, col3], Row 2: [col1, col2, col3]).
+		○ Disk I/O Bottleneck: To extract a single column (e.g., SUM(revenue)), the computer must read every byte of every row across the entire file.
+		○ Limitations: Uncompressed plain text, no embedded schema (types must be inferred/guessed), high storage costs, slow analytical read performance.
+	What is Apache Parquet? (Columnar Storage Format)
+		○ Storage Layout: Flips rows on their side and organizes data into Column Chunks inside distinct Row Groups.
+		○ Binary & Immutable: Parquet is a compressed binary file (often using Snappy compression). Once written to disk, it cannot be edited or updated in place.
+	Internal Anatomy:
+		○ Row Groups: Horizontal partitions of rows (typically 128 MB to 512 MB, ~100k to 1M rows each).
+		○ Column Chunks: Inside each row group, data is grouped column by column on contiguous disk blocks.
+		○ File Footer (Metadata): Sits at the end of the file. Contains:
+			§ Global table schema (data types like INT, STRING, DECIMAL).
+			§ Per-row-group statistics (min_value, max_value, row count, null count).
+	
+Two Core Optimization Mechanisms in Parquet
+	1. Column Pruning:
+		○ Definition: Reading only the specific columns requested in the SELECT, WHERE, or JOIN clauses while bypassing all other unneeded columns entirely.
+		○ Impact: Drastically reduces Disk I/O, network transfer, and memory footprint.
+	2. Predicate Pushdown:
+		○ Definition: Pushing filters (e.g., WHERE age > 40) directly down to the storage layer before reading data blocks into memory.
+		○ Mechanism: The engine reads the footer metadata first. If a Row Group's metadata shows max(age) = 35, that entire Row Group is skipped without loading its data blocks into RAM.
+		
+2. Delta Lake Architecture
+What is Delta Lake?
+	• Core Formula: 
+		Delta Table = Parquet Data Files + Transaction Log Folder
+		
+	• Purpose: It is an open-source storage layer on top of cloud object storage (S3, ADLS, GCS) that brings ACID reliability, concurrency handling, and performance optimizations to standard Parquet files.
+The Transaction Log (_delta_log)
+	• Mechanism: An append-only sequence of JSON files (000000.json, 000001.json, 000002.json...) that serves as the single source of truth.
+Key JSON Actions:
+	• commitInfo: Audit metadata (timestamp, user, operation like WRITE or MERGE, cluster details).
+	• add: Declares a newly written Parquet file as active, including file-level min/max column statistics.
+	• remove: Marks an older Parquet file as obsolete (logical soft delete; does not immediately remove the file from disk).
+Checkpoints: Every 10 commits, Delta writes a combined snapshot file (000010.checkpoint.parquet) so engines do not need to parse thousands of small JSON files on every read.
+
+Copy-on-Write (How Updates and Deletes Work)
+	• Because Parquet files are immutable, an UPDATE cannot overwrite bytes inside an existing file.
+	
+	Execution Flow:
+		a. Engine reads file_1.parquet into RAM.
+		b. Modifies the matching rows in memory.
+		c. Writes the updated data to a brand-new file: file_2.parquet.
+		d. Appends a new commit in _delta_log:
+			§ remove: file_1.parquet
+			§ add: file_2.parquet
+	• Result: Uninterrupted reads (no locking), zero data corruption, and immediate version tracking.
+
+3. ACID Guarantees in Delta Lake
+	• Atomicity: All-or-nothing execution. If a write fails halfway, no JSON commit is recorded in _delta_log. The uncommitted orphan files are ignored by all readers.
+	• Consistency: Schema enforcement blocks records with incorrect types or missing non-null constraints before they corrupt the table.
+	• Isolation (Snapshot Isolation): Concurrent readers always read the latest valid committed snapshot without being blocked by concurrent writers.
+	• Durability: Once a commit JSON file is recorded in _delta_log, changes are permanent on cloud object storage.
+
+4. Time Travel & Lifecycle Maintenance
+	Time Travel
+		○ Mechanism: Querying historical data states using commit versions or timestamps:
+SQL
+
+SELECT * FROM customers VERSION AS OF 1;
+SELECT * FROM customers TIMESTAMP AS OF '2026-10-01';
+	
+	• How It Resolves: The engine reads only the commit files up to that specified version/timestamp, ignoring subsequent remove actions.
+
+	Retention vs. VACUUM (The Critical Distinction)
+Concept	Default Setting	What It Controls	Does It Run Automatically?
+Log Retention (delta.logRetentionDuration)	30 days	Retains JSON transaction files in _delta_log. Merges into checkpoints.	Yes (cleans up metadata automatically during maintenance).
+VACUUM Garbage Collection	7 days (168 hours)	Permanently purges physically obsolete (soft-deleted) Parquet files from cloud storage.	NO. Must be triggered via manual command or scheduled pipeline.
+	Important Rules of VACUUM:
+		a. Never touches active files: Only deletes unreferenced Parquet files whose deletionTimestamp is older than the retention threshold.
+		b. Safety Check: Setting retention under 168 hours (7 days) throws an error unless spark.databricks.delta.retentionDurationCheck.enabled = false is explicitly configured.
+		c. Time Travel Tradeoff: Once VACUUM deletes a file from disk, you can no longer query historical snapshots that depend on that file.
+
+5. Elite Interview Vocabulary Cheatsheet
+	• Instead of saying "It reads only required data", say "It leverages Column Pruning and Predicate Pushdown using footer metadata stats."
+	• Instead of saying "It updates rows", say "It uses Copy-on-Write: marking stale files with a remove action and committing new Parquet files with an add action."
+	• Instead of saying "It stops bad data", say "It guarantees Atomicity and Snapshot Isolation via the append-only _delta_log."
