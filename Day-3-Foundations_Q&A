@@ -1,0 +1,84 @@
+Q1: Why is Parquet called a columnar storage format, and how does it make analytical queries run faster?
+Answer:
+
+Storage Mechanism: Unlike row-oriented formats (like CSV) that store data tuple-by-tuple, Parquet slices datasets into horizontal Row Groups (typically 128 MB or 512 MB). Within each row group, data is organized strictly by column into distinct Column Chunks.
+
+Query Performance Advantage:
+
+Column Pruning (Projection Pushdown): For aggregations or analytical queries (e.g., SELECT AVG(salary) FROM employees), the query engine skips reading non-relevant columns (e.g., name, address, department) entirely from disk.
+
+I/O & Memory Efficiency: Only the specific column chunks required by the query are read into memory, saving disk I/O, network bandwidth, and compute memory.
+
+Q2: What is Predicate Pushdown, and how do Parquet row-group statistics facilitate Data Skipping?
+Answer:
+
+Definition: Predicate Pushdown is an optimization where filtering predicates (WHERE clauses) are evaluated directly at the storage/file metadata level before loading raw record data into memory.
+
+Mechanism:
+
+Parquet stores column metadata and statistics (including [min, max] values, null counts, and row counts) inside each row group's column chunk footer.
+
+When a query like SELECT * FROM employees WHERE salary > 100000; runs, the engine inspects the row group's max_value for salary.
+
+If max_value <= 100000, the engine skips reading that entire row group block. This is known as Data Skipping / Row Group Pruning.
+
+Q3: How does Delta Lake handle updates physically on disk, and what role does the transaction log play?
+Answer:
+
+The _delta_log: Delta Lake adds a companion metadata directory named _delta_log/ alongside Parquet data files. It contains an ordered series of commit JSON files (000000.json, 000001.json, etc.) acting as a single source of truth for table state.
+
+Copy-on-Write (CoW):
+
+Data files on disk are immutable; Delta Lake never mutates existing Parquet files in place.
+
+During an UPDATE or DELETE, Delta copies the existing data, applies the modifications, and writes out a brand-new Parquet file.
+
+In the corresponding JSON commit, Delta writes two specific transaction actions:
+
+remove: Marks the old Parquet file as logically inactive.
+
+add: Marks the new Parquet file as active.
+
+Q4: What is the difference between Schema Enforcement and Schema Evolution in Delta Lake?
+Answer:
+
+Schema Enforcement (Schema Defense):
+
+Behavior: Default safety check. If an incoming write contains unexpected columns, missing non-nullable columns, or type mismatches, Delta aborts the write with an AnalysisException.
+
+Guarantees Protected: Consistency (prevents silent data corruption or downstream pipeline failure) and Atomicity (all-or-nothing write; no partial data is written).
+
+Schema Evolution:
+
+Behavior: The deliberate update of an existing table schema when requirements change.
+
+Implementation:
+
+Via SQL: ALTER TABLE table_name ADD COLUMN column_name data_type;
+
+Via PySpark: .option("mergeSchema", "true") during an append operation.
+
+Handling Historical Data: Historical Parquet files are not rewritten. When older records that predate the new column are queried, Delta Lake dynamically returns NULL for the missing column values.
+
+Q5: How does Time Travel and the RESTORE command operate under the hood in Delta Lake?
+Answer:
+
+Time Travel Queries:
+
+Syntax: SELECT * FROM table_name VERSION AS OF <version>; or TIMESTAMP AS OF <timestamp>;
+
+Reads the transaction log up to the specified snapshot, reconstructing the table state by referencing only the Parquet files active at that exact commit.
+
+Disaster Recovery (RESTORE):
+
+Command: RESTORE TABLE table_name TO VERSION AS OF 7;
+
+Internal Mechanics:
+
+Delta Lake transaction logs are strictly append-only.
+
+Rolling back does not erase or rewind bad commits (e.g., Version 8 is not deleted).
+
+Delta creates a forward commit (Version 9) whose metadata registers the active file manifest to match the state of Version 7.
+
+Production Benefit: Preserves a complete, tamper-evident audit history showing both the breaking event and the corrective restoration.
