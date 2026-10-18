@@ -1,0 +1,165 @@
+Here is the complete, consolidated single markdown note containing the theory, hands-on code, deep-dive metric explanations, and interview Q&A. You can copy this directly into your repository (e.g., `01_delta_lake/03_merge_into_upserts.md`).
+
+---
+
+# Topic 6: Delta Lake MERGE INTO (Upserts & SCD Type 1)
+
+## 1. Architectural Theory & Core Mental Model
+
+### What is an Upsert?
+
+An **Upsert** (`UPDATE` + `INSERT`) synchronizes a destination table with an incoming batch or stream of events containing a mixture of:
+
+* **Existing records** that require modifications.
+* **Brand-new records** that must be appended.
+
+### Slowly Changing Dimension (SCD) Type 1
+
+* **Concept:** Overwrites existing attributes with new values in place.
+* **History:** Retains zero historical tracking. The target table reflects exclusively the current state of truth.
+
+### Physical Execution Under the Hood
+
+1. **Join Phase & File Pruning (Data Skipping):**
+* Delta Lake joins the incoming batch and target table on the merge condition (`target.id = source.id`).
+* Using row-group min/max statistics stored in Parquet footers and the `_delta_log`, Delta isolates only the specific Parquet files containing matching keys. The rest of the table's files remain completely untouched on cloud storage.
+
+
+2. **Copy-on-Write (CoW):**
+* Parquet files are immutable—they cannot be edited in place.
+* Delta reads the matching Parquet files, updates the targeted rows, carries over any unaffected rows from those specific files, and writes the output into brand-new Parquet files.
+* Unmatched incoming rows (`WHEN NOT MATCHED`) are written into new Parquet files.
+
+
+3. **Atomic Commit:**
+* Delta commits a single JSON file into `_delta_log/` recording the old files as `remove` actions and the newly created files as `add` actions.
+* If any failure occurs, the commit is aborted, ensuring complete ACID compliance with zero partial writes.
+
+
+
+---
+
+## 2. Hands-on Databricks Implementation
+
+```sql
+-- Step 1: Create Target Table (Silver Layer)
+CREATE OR REPLACE TABLE customers_silver (
+    customer_id INT,
+    customer_name STRING,
+    city STRING,
+    email STRING
+) USING DELTA;
+
+-- Initial Seed (3 records)
+INSERT INTO customers_silver VALUES
+    (1, 'Arun', 'Chennai', 'arun@example.com'),
+    (2, 'Priya', 'Bengaluru', 'priya@example.com'),
+    (3, 'Karthik', 'Hyderabad', 'karthik@example.com');
+
+-- Step 2: Incoming Source Batch (1 Update, 1 Insert)
+CREATE OR REPLACE TEMP VIEW customers_incoming AS
+SELECT 1 AS customer_id, 'Arun' AS customer_name, 'Coimbatore' AS city, 'arun_new@example.com' AS email
+UNION ALL
+SELECT 4 AS customer_id, 'Deepa' AS customer_name, 'Chennai' AS city, 'deepa@example.com' AS email;
+
+-- Step 3: Atomic MERGE INTO (SCD Type 1)
+MERGE INTO customers_silver AS target
+USING customers_incoming AS source
+ON target.customer_id = source.customer_id
+
+WHEN MATCHED THEN
+  UPDATE SET
+    target.city = source.city,
+    target.email = source.email
+
+WHEN NOT MATCHED THEN
+  INSERT (customer_id, customer_name, city, email)
+  VALUES (source.customer_id, source.customer_name, source.city, source.email);
+
+-- Step 4: Verify Table State
+SELECT * FROM customers_silver ORDER BY customer_id;
+
+-- Step 5: Audit Transaction History & Metrics
+SELECT 
+    version,
+    timestamp,
+    operation,
+    operationMetrics.numTargetRowsUpdated AS rows_updated,
+    operationMetrics.numTargetRowsInserted AS rows_inserted,
+    operationMetrics.numTargetRowsCopied AS rows_copied,
+    operationMetrics.numSourceRows AS source_rows_scanned
+FROM (DESCRIBE HISTORY customers_silver)
+WHERE operation = 'MERGE'
+ORDER BY version DESC
+LIMIT 1;
+
+```
+
+---
+
+## 3. Dissecting `DESCRIBE HISTORY` Metrics
+
+| Metric | Physical Meaning | Example Value from Run |
+| --- | --- | --- |
+| **`rows_updated`** | Number of existing rows in the target table whose keys matched the incoming source and had their columns updated. | `1` (Arun) |
+| **`rows_inserted`** | Number of brand-new records in the source whose keys were absent in the target and were appended as new rows. | `1` (Deepa) |
+| **`rows_copied`** | Number of untouched records that shared a physical Parquet file with an updated record and had to be copied over into the replacement Parquet file due to file immutability. When `0`, untouched records lived in completely separate, undisturbed files. | `0` (Priya & Karthik) |
+| **`source_rows_scanned`** | Total number of records evaluated from the incoming batch view. | `2` |
+
+---
+
+## 4. Production Edge Cases & Solutions
+
+### The Duplicate Source Key Failure
+
+* **Failure Scenario:** An incoming batch contains multiple records sharing the same primary key (e.g., ID `1` appears twice with different cities).
+* **Delta Lake Reaction:** Aborts immediately with `DeltaAnalysisException: Cannot perform MERGE as multiple source rows matched the same target row`.
+* **Underlying Reason:** Enforcing ACID consistency. Allowing this creates a non-deterministic update where Delta cannot know which source value should overwrite the target state.
+* **Production Fix (Deduplication before Merge):**
+
+```sql
+WITH deduplicated_source AS (
+    SELECT 
+        customer_id,
+        customer_name,
+        city,
+        email,
+        ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY updated_at DESC) AS rn
+    FROM incoming_feed
+)
+MERGE INTO customers_silver AS target
+USING (SELECT * FROM deduplicated_source WHERE rn = 1) AS source
+ON target.customer_id = source.customer_id
+WHEN MATCHED THEN
+  UPDATE SET target.city = source.city, target.email = source.email
+WHEN NOT MATCHED THEN
+  INSERT (customer_id, customer_name, city, email)
+  VALUES (source.customer_id, source.customer_name, source.city, source.email);
+
+```
+
+---
+
+## 5. Interview Q&A Bank
+
+### Q1: What makes `MERGE INTO` superior to running a `DELETE` followed by an `INSERT`?
+
+* **Atomicity & ACID Safety:** A separate `DELETE` and `INSERT` creates two distinct transactions. A failure between them leaves the table corrupted or incomplete. `MERGE INTO` executes both operations as a single, all-or-nothing transaction.
+* **Reader Isolation:** Readers querying the table concurrently will never see intermediate empty or missing states.
+* **I/O Efficiency:** It evaluates both updates and inserts in a single read/join pass rather than scanning the table twice.
+
+### Q2: What does SCD Type 1 mean?
+
+* **Answer:** Slowly Changing Dimension Type 1 overwrites existing record attributes in place. No historical versions or audit trails of previous values are retained in the active table view; it only reflects the current truth.
+
+### Q3: If a target table has 500 Parquet data files, does a `MERGE INTO` rewrite all 500 files?
+
+* **Answer:** No. Delta Lake uses file metadata and row-group min/max statistics in the `_delta_log` to perform Data Skipping. Only the specific files containing records that match the incoming merge keys are read, modified, and rewritten. The remaining files are left completely untouched on storage.
+
+### Q4: In `DESCRIBE HISTORY`, what does `numTargetRowsCopied` mean physically?
+
+* **Answer:** Because Parquet files are immutable, if an unchanged row happens to reside in the exact same physical Parquet file as a row that was updated or deleted, Delta Lake must read that unchanged row and copy it into the newly written replacement file so it is not lost.
+
+### Q5: How does Delta Lake handle duplicate join keys in the incoming source dataset during a `MERGE INTO`?
+
+* **Answer:** Delta Lake throws a `DeltaAnalysisException` and fails the transaction to prevent non-deterministic updates. In production pipelines, incoming batches must be deduplicated (e.g., using a `ROW_NUMBER()` window function) to guarantee a 1-to-1 match against target keys before merging.
