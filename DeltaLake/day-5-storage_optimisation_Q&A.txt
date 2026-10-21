@@ -1,0 +1,31 @@
+Lab Examination & Scenario Q&A
+Q1: Streaming Ingestion Degradation
+Scenario: A streaming pipeline appends micro-batches every 30 seconds. Over 24 hours, queries on the 5 GB table slow down significantly.
+
+Root Cause: Accumulation of ~2,880 tiny Parquet files (small file problem). The driver spends excessive time listing files, reading footers, and coordinating micro-tasks rather than processing data.
+
+Resolution: Run OPTIMIZE table_name [ZORDER BY (...)]. It bin-packs small files into ~1 GB files, tombstones the small files in the log, and registers the compacted files.
+
+Q2: Storage Surge Post-OPTIMIZE & Space Reclamation
+Scenario: Immediately after running OPTIMIZE, cloud storage usage jumps from 5 GB to ~10 GB instead of decreasing.
+
+Root Cause: Delta Lake creates new compacted files without deleting the original small files. Both file sets remain on disk simultaneously to support active concurrent readers and Time Travel.
+
+Resolution: Run VACUUM table_name RETAIN 0 HOURS (after configuring retention properties).
+
+Trade-off: Permanently disables Time Travel to versions referencing the purged files (resulting in FileNotFoundException or FileReadException) and risks terminating concurrent active readers.
+
+Q3: Column Selection in ZORDER BY
+Scenario: A proposal suggests running:
+
+SQL
+OPTIMIZE sales_orders ZORDER BY (order_id, region, order_date);
+where order_id is a unique key (10M distinct values), region has 4 values, and order_date has 365 values.
+
+Issue:
+
+Curse of Dimensionality: Bit-interleaving across 3+ dimensions dilutes spatial clustering. Values for region and order_date get scattered across nearly all files, widening min/max boundaries and reducing data skipping toward 0%.
+
+High Cardinality Primary Key: A unique ID like order_id dominates the bit space and separates records of the same date/region, preventing effective grouping.
+
+Best Practice: Select 1 to 3 frequently filtered columns with moderate-to-high clustering potential (e.g., ZORDER BY (order_date, region)). Avoid unique identifiers and ultra-low cardinality flags.
