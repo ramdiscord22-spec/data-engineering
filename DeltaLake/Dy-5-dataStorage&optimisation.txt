@@ -1,0 +1,119 @@
+# Delta Lake Storage Maintenance & Optimization Notes
+
+## 1. The Small File Problem & Compaction (`OPTIMIZE`)
+
+### The Problem
+
+* Streaming micro-batches or frequent `MERGE`/`INSERT` operations create thousands of tiny Parquet files (e.g., 2–5 MB each).
+* Spark query planning slows down dramatically because of the metadata overhead: listing thousands of files, reading thousands of Parquet footers, and scheduling small tasks.
+
+### The Fix
+
+```sql
+OPTIMIZE table_name;
+
+```
+
+* **Bin-Packing:** Consolidates many small Parquet files into balanced, query-friendly files (targeting ~1 GB).
+* **Metadata Impact:** Marks small files as logically removed (`remove`) and logs the new compacted files as active (`add`) in the transaction log.
+* **Storage Reality:** Does **not** immediately free up storage space. The old small files remain on disk side by side with the new files until pruned.
+
+---
+
+## 2. Multi-Dimensional Clustering (`Z-ORDER BY`)
+
+### Parquet Data Skipping Mechanics
+
+* Each Parquet file contains **Row Groups**, and their footers store `min` and `max` statistics for each column.
+* Spark evaluates query filters (`WHERE customer_id = 450`) against these `min`/`max` ranges. If the target value falls outside the boundary, the entire file/row group is skipped without reading data rows.
+* For string/text columns (e.g., `city`), bounds are determined via **lexicographical (alphabetical) order** using byte values (default prefix indexed up to 32 characters).
+
+### How Z-Order Improves Skipping
+
+```sql
+OPTIMIZE table_name ZORDER BY (col1, col2);
+
+```
+
+* **Space-Filling Curve:** Interleaves bits from multiple columns to co-locate related records within the same files and row groups with equal priority.
+* **Tightens Ranges:** Reduces wide, overlapping min/max ranges across files, enabling Spark to skip 80–95% of Parquet files during queries.
+
+### Choosing Z-Order Columns
+
+* **Filter Frequency:** Pick columns that appear heavily in `WHERE` filters or `JOIN` conditions.
+* **Cardinality Sweet Spot:**
+* *Avoid Ultra-Low Cardinality (e.g., boolean, 2–4 distinct values):* Values end up across all files anyway; min/max boundaries will never exclude a file.
+* *Avoid 100% Unique Keys in Multi-Column Z-Order (e.g., UUID, `order_id`):* Dilutes the clustering curve and scatters other columns.
+* *Target Moderate-to-High Cardinality:* Values that naturally clump together (e.g., `order_date`, `region`, `customer_id`).
+
+
+* **Column Count Limit:** Stick to **1 to 3 columns** (max 4). Each additional dimension exponentially dilutes the skipping power of the others (Curse of Dimensionality).
+
+---
+
+## 3. Storage Pruning & Retention (`VACUUM`)
+
+### Why Delta Retains Old Files
+
+* **Time Travel:** Allows running queries like `SELECT * FROM table VERSION AS OF n`.
+* **Snapshot Isolation:** Ensures long-running concurrent queries do not crash midway if an update/merge creates newer file versions.
+
+### The Cleanup Mechanism
+
+```sql
+VACUUM table_name [RETAIN num HOURS];
+
+```
+
+* **What it does:** Scans cloud storage for tombstoned (`remove`) Parquet data files older than the retention threshold and permanently deletes them from disk.
+* **Default Retention:** **168 hours (7 days)** safety window to protect active readers.
+* **Trade-off with `RETAIN 0 HOURS`:**
+* Immediately frees up storage and cuts cloud storage costs.
+* Permanently breaks Time Travel to versions relying on deleted files (`FileNotFoundException`).
+* In Unity Catalog / Shared clusters, overriding the 7-day retention safety check requires setting table properties directly:
+```sql
+ALTER TABLE table_name SET TBLPROPERTIES ('delta.deletedFileRetentionDuration' = 'interval 0 hours');
+
+```
+
+
+
+
+
+---
+
+## 4. Metadata Architecture: `_delta_log` & Checkpoints
+
+### Log Files (`.json`)
+
+* Delta writes atomic changes into `_delta_log/000000.json`, `000001.json`, etc.
+* Running `VACUUM` **deletes Parquet data files only**; it **does not delete `_delta_log/*.json` commit files**. The history in `DESCRIBE HISTORY` remains visible even after the underlying data files are purged.
+
+### Checkpoints (`.checkpoint.parquet`)
+
+* Produced automatically every **10 commits** (`000010.checkpoint.parquet`, `000020.checkpoint.parquet`).
+* **Self-Contained & Cumulative:** Checkpoint 20 is not nested inside Checkpoint 10. It collapses the net active state of all transactions up to commit 20.
+* **Reader Performance:** Query engines only read the latest checkpoint file plus any subsequent JSON commits, completely bypassing the need to replay hundreds or thousands of old JSON files.
+
+### Log File Purging
+
+* Controlled by the table property:
+```text
+delta.logRetentionDuration = "interval 30 days"
+
+```
+
+
+* Delta does not use a background daemon. Old `.json` commits and older `.checkpoint.parquet` files are purged **lazily** during subsequent write transactions once they exceed the retention window and are superseded by a newer checkpoint.
+
+---
+
+## Quick Reference Summary
+
+| Concept | Layer | Action | Impact |
+| --- | --- | --- | --- |
+| **`OPTIMIZE`** | Physical Data (`.parquet`) | Merges small files into ~1 GB files | Fixes small file problem, speeds up query planning |
+| **`ZORDER BY`** | Row Arrangement | Clusters data multidimensionally | Tightens min/max ranges in footers, maximizes file skipping |
+| **`VACUUM`** | Physical Data (`.parquet`) | Permanently deletes tombstoned files past retention | Frees storage space; limits Time Travel history |
+| **Checkpointing** | Metadata (`_delta_log`) | Consolidates commit logs every 10 commits | Speeds up table state reconstruction for readers |
+| **Log Retention** | Metadata (`_delta_log`) | Purges commit JSONs older than 30 days | Prevents transaction log folder bloat |
