@@ -1,0 +1,149 @@
+Here is the standalone Markdown file covering everything studied after Time Travel and VACUUM (`delta-lake/02-optimization-schema-and-mutations.md`), without the cheat sheet.
+
+### File: `delta-lake/02-optimization-schema-and-mutations.md`
+
+```markdown
+# Delta Lake: Performance Optimization, Schema Governance & Mutations
+
+Detailed technical documentation covering file compaction, multi-dimensional data skipping, concurrency control, schema management, dimensional modeling, and Change Data Feed (CDF).
+
+---
+
+## 1. Performance Optimization & Data Skipping
+
+### The Small File Problem
+High-frequency streaming micro-batches or over-partitioned tables produce thousands of tiny Parquet files ($<10\text{ MB}$). This degrades read performance due to:
+* Cloud object storage API rate limiting (`LIST` / `GET` request overhead).
+* Spark Driver memory exhaustion from holding excessive file metadata and statistics.
+* Poor Parquet columnar compression ratios.
+
+### Compaction (`OPTIMIZE`)
+Coalesces small data files into uniform $\approx 1\text{ GB}$ Parquet files using bin-packing without altering the logical table state (`dataChange: false` in `_delta_log`). Historical small files are marked as tombstones (`remove` actions).
+
+```sql
+-- Compact an entire table
+OPTIMIZE sales_table;
+
+-- Compact a specific partition subset
+OPTIMIZE sales_table WHERE event_date >= '2026-11-01';
+
+```
+
+### Metadata Data Skipping
+
+Delta Lake automatically collects column-level statistics (`min`, `max`, `nullCount`) for the **first 32 columns** of every Parquet file and stores them inside `_delta_log/*.json`. During query planning, the engine evaluates `WHERE` clause predicates against these min/max boundaries to prune irrelevant files before reading disk blocks.
+
+### Partitioning vs. Z-Ordering
+
+* **Partitioning:** Organizes data into physical subdirectories (`date=2026-11-10/`). Effective only for low-cardinality columns where each partition contains $\ge 1\text{ GB}$ of data.
+* **Z-Ordering (Bit Interleaving):** Maps multi-dimensional column values onto a one-dimensional space-filling curve (Morton order). Co-locates related values across multiple high-cardinality filter columns within the same physical files to maximize data skipping.
+
+```sql
+OPTIMIZE sales_table ZORDER BY (customer_id, product_id);
+
+```
+
+---
+
+## 2. Concurrency & Schema Management
+
+### Optimistic Concurrency Control (OCC)
+
+Delta Lake allows concurrent writers without pessimistic locks using a four-step protocol:
+
+1. **Read:** Reader records the starting table version ($V_0$).
+2. **Compute:** Transformations execute independently in memory.
+3. **Attempt Commit:** Writer attempts to atomically write version $V_1$.
+4. **Conflict Check:** If another writer already committed $V_1$, Delta inspects whether modified file sets overlap. If disjoint, the transaction retries and commits as $V_2$; if overlapping, it throws a `ConcurrentModificationException`.
+
+### Schema Enforcement vs. Schema Evolution
+
+* **Schema Enforcement (Default):** Acts as a write-time gatekeeper. Blocks incoming DataFrames with unexpected columns or incompatible data types by raising an `AnalysisException`.
+* **Schema Evolution (`mergeSchema`):** Safely appends new columns to table metadata without rewriting existing Parquet files on disk. When queries read historical files lacking the new column, the engine dynamically projects `NULL` values in memory.
+
+```python
+df.write.format("delta") \
+  .mode("append") \
+  .option("mergeSchema", "true") \
+  .save("/path/to/delta_table")
+
+```
+
+---
+
+## 3. Medallion Architecture & Data Flow Direction
+
+```
+[Upstream Sources] ──► [Bronze Layer] ──► [Silver Layer] ──► [Gold Layer] ──► [Downstream Consumers]
+
+```
+
+* **Upstream vs. Downstream:** **Upstream** refers to source systems or tables feeding data into a pipeline; **Downstream** refers to target tables, BI tools, or services consuming processed outputs.
+* **Bronze Layer:** Raw, append-only ingestion preserving original source payloads for auditability and replay.
+* **Silver Layer:** Cleansed, deduplicated, schema-enforced enterprise source of truth.
+* **Gold Layer:** Pre-aggregated business metrics and dimensional marts optimized for BI dashboards and ML models.
+
+---
+
+## 4. Lakehouse Mutations & Write Amplification
+
+### `MERGE INTO` Two-Phase Execution
+
+```sql
+MERGE INTO silver_customers AS target
+USING bronze_updates AS source
+ON target.country = 'IN' AND target.customer_id = source.customer_id
+WHEN MATCHED THEN
+  UPDATE SET target.city = source.city, target.updated_at = current_timestamp()
+WHEN NOT MATCHED THEN
+  INSERT (customer_id, name, city, updated_at)
+  VALUES (source.customer_id, source.name, source.city, current_timestamp());
+
+```
+
+1. **Phase 1 (Search / Join):** Joins source keys against target metadata to identify exact Parquet files containing matching rows.
+2. **Phase 2 (Rewrite / Commit):** Reads matched files into memory, applies updates/inserts, writes brand-new Parquet files, and tombstones the replaced files.
+
+### Write Amplification
+
+Because Parquet files are immutable, updating a single row inside a $100\text{ MB}$ file requires rewriting the entire $100\text{ MB}$ file.
+
+* **Mitigation:** Include partition filter predicates directly in the `MERGE ... ON` condition and run periodic `ZORDER` jobs on merge keys to minimize row scatter across files.
+
+---
+
+## 5. Dimensional Modeling & Slowly Changing Dimensions (SCD)
+
+* **Fact Tables:** High-volume transactional events and quantitative measurements (`orders`, `payments`, `clickstream`).
+* **Dimension Tables:** Descriptive master context (`customers`, `products`, `stores`).
+* **SCD Type 1 (Overwrite):** Updates records in place; maintains current state only with zero historical tracking.
+* **SCD Type 2 (Full History):** Retains historical versions using `start_date`, `end_date`, and `is_current` flags. Implemented via the **Two-Pass Union Pattern**, duplicating matched incoming records so one pass expires the active row (`is_current = false`) and a second pass inserts the new active row (`is_current = true`).
+
+---
+
+## 6. Change Data Feed (CDF)
+
+Enables row-level incremental change tracking between commit versions so downstream consumers avoid full table scans.
+
+```sql
+-- Enable CDF on an existing table
+ALTER TABLE silver_customers SET TBLPROPERTIES (delta.enableChangeDataFeed = true);
+
+-- Query incremental changes across versions
+SELECT * FROM table_changes('silver_customers', 2, 5);
+
+```
+
+### CDF Event Signatures (`_change_type`)
+
+| Event Type | Description |
+| --- | --- |
+| `insert` | Newly inserted record. |
+| `delete` | Deleted record. |
+| `update_preimage` | Snapshot of row values **prior** to modification. |
+| `update_postimage` | Snapshot of row values **after** modification. |
+
+```
+
+---
+
