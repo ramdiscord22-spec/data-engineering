@@ -1,0 +1,64 @@
+# Module 2: Apache Kafka Producer Internals & Reliability
+
+## 1. Partitioning & Ordering Mechanics
+
+When a Producer sends a record to a multi-partition topic, it decides the target partition using two strategies:
+
+### A. Keyed Messages (`key != null`) — Strict Ordering
+* **Formula:** `Partition = murmur2(key) % num_partitions`
+* **Behavior:** All messages with the exact same key (e.g., `user_101`) always land in the same partition, preserving strict sequential order.
+* **Partition Scaling Trap:** Increasing partition count mid-stream (e.g., from `3` to `6`) changes the modulo result for **new incoming messages** (existing disk logs do not move), breaking key-based ordering.
+
+### B. Keyless Messages (`key == null`) — Sticky Partitioner
+* **Behavior:** Instead of round-robin per message, the producer fills an entire batch for a single partition before switching to the next partition. This minimizes network requests and maximizes throughput.
+* **Batch Triggers (When does a batch send & switch partition?):**
+  1. `batch.size` (default `16 KB`) is reached, **OR**
+  2. `linger.ms` (default `0 ms`, typically tuned to `5–20 ms`) timer expires.
+
+---
+
+## 2. Producer Acknowledgments (`acks`) — Speed vs. Durability
+
+Controls how many broker replicas must persist a record before the Producer receives a confirmation (`RecordMetadata` containing Topic, Partition, Base Offset, and Timestamp).
+
+| Setting | Confirmation Requirement | Latency / Speed | Data Loss Risk | Typical Use Case |
+| :--- | :--- | :--- | :--- | :--- |
+| **`acks=0`** | No acknowledgment waited (Fire & Forget) | Fastest | High | IoT sensors, clickstream metrics |
+| **`acks=1`** | Leader broker writes to local disk | Medium | Low (Data lost if Leader crashes before followers replicate) | Standard application logs |
+| **`acks=all` (`-1`)** | Leader + all In-Sync Replicas (ISR) write to disk | Slowest | **Zero** | Payments, financial transactions, critical CDC |
+
+---
+
+## 3. Retries & Idempotence (`enable.idempotence=true`)
+
+### The Retry Duplicate Problem
+With `acks=all`, if the Leader & ISRs write a message to disk (`Offset 10`) but the returning `ACK` packet drops due to a network blip, the Producer retries and resends the message—causing duplicate records (`Offset 11`).
+
+### How Kafka Solves It (Idempotent Producer)
+Enabled by default in Kafka 3.0+ (`enable.idempotence=true`), the Producer attaches two hidden metadata tags to every batch:
+1. **Producer ID (`PID`):** Unique ID assigned to the producer session upon startup.
+2. **Sequence Number (`Seq`):** Monotonically increasing counter (`0, 1, 2...`) per partition.
+
+* **Broker Deduplication:** If the broker receives `(PID=42, Seq=5)` again after already persisting `Seq=5`, it skips writing to disk and simply returns a success `ACK`—guaranteeing **exactly-once** writes per partition without duplicates.
+
+---
+
+## 4. Revision Q&A (Module 1 & Module 2)
+
+**Q1. An `orders` topic has 4 partitions. You start 6 consumers in `billing-group` and 2 consumers in `analytics-group`. How many consumers actively read data in each group, and does `analytics-group` receive all messages?**
+* **Answer:** In `billing-group`, **4 consumers** actively read (1 partition per consumer) and **2 remain idle** because max parallelism within a single group is capped at the partition count. In `analytics-group`, **both consumers** actively read (2 partitions each) and receive **100% of the data** because different consumer groups maintain independent offsets (Group Isolation).
+
+**Q2. Once a consumer reads a message from Kafka, is it deleted from disk? What are the 3 core files inside a partition directory on disk?**
+* **Answer:** No. Kafka uses an immutable, append-only commit log—messages remain on disk until the retention policy expires. Inside each partition directory (`orders-0`), Kafka stores `.log` (actual data segments), `.index` (offset-to-position index), and `.timeindex` (timestamp-to-offset index) files.
+
+**Q3. You produce keyed messages (`key = user_id`) to a 3-partition `payments` topic, then increase partitions from `3` to `6` to handle higher traffic. What breaks?**
+* **Answer:** Existing messages already written on disk stay in their original partitions, while **new incoming messages** get routed using the updated modulo (`murmur2(key) % 6`). Because records for the same `user_id` now split across old and new partitions, **strict key-based message ordering breaks**.
+
+**Q4. When sending 5 small keyless (`key = null`) messages, they all land in `Partition 0` instead of round-robining across partitions. Why does this happen, and when does the producer switch to the next partition?**
+* **Answer:** This is the **Sticky Partitioner** behavior. The producer batches keyless records into a single partition to reduce network overhead and only switches to the next partition once the current batch is sent—triggered when either **`batch.size` (`16 KB`)** fills up or the **`linger.ms`** timer expires.
+
+**Q5. With `acks=1`, the Leader broker writes a message to disk and sends an `ACK` to the producer, then crashes in the exact same millisecond before followers replicate it. Is data lost?**
+* **Answer:** **Yes, data is permanently lost.** Because `acks=1` only waits for the Leader's local disk write, an un-replicated follower gets promoted as the new Leader without that record. (`acks=all` prevents this by waiting for all In-Sync Replicas).
+
+**Q6. During a network blip where the returning `ACK` drops, the producer retries and resends the same payment message. How does Kafka prevent writing a duplicate record to disk?**
+* **Answer:** With `enable.idempotence=true`, the producer tags every batch with a **Producer ID (`PID`)** and a **Sequence Number (`Seq`)**. When the broker receives a retry with an already-committed `(PID, Seq)` pair, it detects the duplicate in memory, skips writing to disk, and simply resends the `ACK`.
